@@ -1,0 +1,11 @@
+{
+    "limit": 1000,
+    "min_gap_percentage": 0.5,
+    "candle_offsets": {
+        "first_case": {"first_fvg_start": -5, "first_fvg_end": -3, "second_fvg_start": -2, "second_fvg_end": 0},
+        "second_case": {"first_fvg_start": -5, "first_fvg_end": -3, "second_fvg_start": -3, "second_fvg_end": -1}
+    },
+    "mongodb_uri": "mongodb://localhost:27017/",
+    "database_name": "ifvg_database",
+    "collection_name": "ifvgs"
+}
