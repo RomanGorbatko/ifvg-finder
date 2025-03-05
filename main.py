@@ -1,6 +1,8 @@
 import argparse
+import asyncio
+from pprint import pprint
 from typing import Dict, List, Optional
-
+from telegram import Bot
 import ccxt
 import pandas as pd
 import logging
@@ -32,7 +34,7 @@ def parse_arguments() -> argparse.Namespace:
     """Парсить аргументи командного рядка для аналізу IFVG.
 
     Returns:
-        argparse.Namespace: Об'єкт із аргументами --symbol, --timeframe, --plot.
+        argparse.Namespace: Об'єкт із аргументами --symbol, --timeframe, --plot, --monitor.
     """
     parser = argparse.ArgumentParser(
         description="Аналіз IFVG для криптовалютної пари та таймфрейму."
@@ -47,8 +49,8 @@ def parse_arguments() -> argparse.Namespace:
         "--timeframe",
         type=str,
         required=True,
-        help="Таймфрейм (наприклад, 1m, 4h, 1d)",
-        choices=["15m", "30m", "1h", "4h", "1d"],
+        help="Таймфрейм (наприклад, 5m, 4h, 1d)",
+        choices=["5m", "15m", "30m", "1h", "4h", "1d"],
     )
     parser.add_argument(
         "--plot",
@@ -56,7 +58,69 @@ def parse_arguments() -> argparse.Namespace:
         default=False,
         help="Увімкнути генерацію графіків (за замовчуванням вимкнено)",
     )
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        default=False,
+        help="Увімкнути режим моніторингу тестування непротестованих IFVG (за замовчуванням вимкнено)",
+    )
     return parser.parse_args()
+
+
+async def send_telegram_message(message: str) -> None:
+    """Асинхронно відправляє повідомлення через Telegram.
+
+    Args:
+        message (str): Текст повідомлення для відправки.
+    """
+    bot = Bot(token=config["telegram_bot_token"])
+    await bot.send_message(chat_id=config["chat_id"], text=message)
+
+
+def monitor_ifvgs() -> None:
+    """Моніторить непротестовані IFVG, перевіряючи їх тестування на хвилинному таймфреймі.
+
+    Виконує перевірку для всіх символів Binance Futures Perpetual, використовуючи лише дві останні свічки (поточну та попередню хвилину).
+    Оновлює статус IFVG у MongoDB і відправляє повідомлення через Telegram, якщо IFVG протестований.
+    """
+    symbols = get_binance_futures_symbols(EXCHANGE)
+    for symbol in symbols:
+        # Завантажуємо лише дві останні свічки на 1m
+        df = fetch_ohlcv(EXCHANGE, symbol, "5m", limit=2)
+        if df.empty:
+            logging.warning(
+                f"Не вдалося завантажити дані для {symbol} на 1m, пропускаємо."
+            )
+            continue
+
+        # Отримуємо всі непротестовані IFVG для цього символу
+        unmitigated_ifvgs = collection.find({"symbol": symbol, "status": "unmitigated"})
+
+        for ifvg in unmitigated_ifvgs:
+            ifvg_data = {
+                "first_fvg": ifvg["first_fvg"],
+                "second_fvg": ifvg["second_fvg"],
+                "ifvg_type": ifvg["ifvg_type"] + " IFVG",
+                "case": ifvg["case"],
+            }
+            # Перевіряємо, чи IFVG протестований на основі поточних або попередніх даних
+            if is_ifvg_mitigated(df, ifvg_data):
+                # Оновлюємо статус на 'mitigated'
+                collection.update_one(
+                    {"stable_id": ifvg["stable_id"]}, {"$set": {"status": "mitigated"}}
+                )
+                # Формуємо повідомлення для Telegram
+                message = (
+                    f"Symbol: ${symbol.split('/')[0]}\n"
+                    f"Timeframe: {ifvg['timeframe']}\n"
+                    f"Stable ID: {ifvg['stable_id']}\n"
+                    f"Type: {ifvg['ifvg_type']} (Case: {ifvg['case']})"
+                )
+                # Асинхронно відправляємо повідомлення
+                asyncio.run(send_telegram_message(message))
+                logging.info(
+                    f"IFVG з ID {ifvg['stable_id']} оновлено на 'mitigated' для {symbol}"
+                )
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -266,11 +330,22 @@ def is_ifvg_mitigated(df: pd.DataFrame, ifvg: Dict) -> bool:
     ifvg_high = max(ifvg["first_fvg"]["high"], ifvg["second_fvg"]["high"])
     ifvg_low = min(ifvg["first_fvg"]["low"], ifvg["second_fvg"]["low"])
 
-    end_idx = df.index[df["timestamp"] == ifvg_end].tolist()[0]
+    # Перевіряємо, чи є свічка з точним timestamp у df
+    matching_indices = df.index[df["timestamp"] == ifvg_end]
+    if len(matching_indices) == 0:
+        # Якщо точного збігу немає, шукаємо найближчу свічку після ifvg_end
+        closest_idx = df.index[df["timestamp"] >= ifvg_end].min()
+        if pd.isna(closest_idx):
+            return False  # Якщо немає свічок після ifvg_end, вважаємо IFVG не протестованим
+        end_idx = closest_idx
+    else:
+        end_idx = matching_indices[0]
+
     if end_idx >= len(df) - 1:
         return False
 
-    for i in range(end_idx + 1, len(df)):
+    # Перевіряємо лише свічки після ifvg_end
+    for i in range(int(end_idx) + 1, len(df)):
         candle = df.iloc[i]
         if (
             ifvg_low <= candle["high"] <= ifvg_high
@@ -671,57 +746,72 @@ def print_fvg_pairs(fvg_pairs: List[Dict]) -> None:
 
 
 def main() -> None:
-    """Основна функція для аналізу IFVG та генерації графіків.
+    """Основна функція для аналізу IFVG та моніторингу тестування.
 
     Виконує аналіз для вказаного символу або всіх символів Binance Futures Perpetual,
-    залежно від аргументів командного рядка.
+    або моніторинг тестування непротестованих IFVG, залежно від аргументів командного рядка.
     """
     args = parse_arguments()
     symbol: Optional[str] = args.symbol
     timeframe: str = args.timeframe
     plot_enabled: bool = args.plot
+    monitor: bool = args.monitor
 
-    if symbol is None:
-        symbols = get_binance_futures_symbols(EXCHANGE)
-        for symbol in symbols:
-            base_symbol = symbol.split("/")[0]
-            print(f"\nОбробка символу {base_symbol} на {timeframe}...")
-            df = fetch_ohlcv(EXCHANGE, symbol, timeframe, config["limit"])
+    if monitor:
+        if timeframe != "5m":
+            logging.error("Режим моніторингу підтримує лише таймфрейм '5m'")
+            return
+        monitor_ifvgs()
+    else:
+        if timeframe == "5m":
+            logging.warning(
+                "Таймфрейм '5m' підтримується лише в режимі моніторингу. Використовуйте 15m, 30m, 1h, 4h або 1d для аналізу."
+            )
+            return
+
+        if symbol is None:
+            symbols = get_binance_futures_symbols(EXCHANGE)
+            for symbol in symbols:
+                base_symbol = symbol.split("/")[0]
+                print(f"\nОбробка символу {base_symbol} на {timeframe}...")
+                df = fetch_ohlcv(EXCHANGE, symbol, timeframe, config["limit"])
+                if df.empty:
+                    print(
+                        f"Не вдалося завантажити дані для {base_symbol}, пропускаємо."
+                    )
+                    continue
+
+                print(
+                    f"Пошук пар FVG для IFVG з фільтром >{config['min_gap_percentage']}% для {base_symbol}..."
+                )
+                fvg_pairs = find_all_fvg_pairs(df, symbol, timeframe)
+
+                print_fvg_pairs(fvg_pairs)
+                if plot_enabled:
+                    plot_ifvg(
+                        base_symbol,
+                        timeframe,
+                        df,
+                        fvg_pairs,
+                        filename=f"ifvg_chart_{base_symbol}_{timeframe}.png",
+                    )
+        else:
+            base_symbol = symbol
+            full_symbol = f"{base_symbol}/USDT"
+            print(f"Завантаження даних для {base_symbol} на {timeframe}...")
+            df = fetch_ohlcv(EXCHANGE, full_symbol, timeframe, config["limit"])
             if df.empty:
-                print(f"Не вдалося завантажити дані для {base_symbol}, пропускаємо.")
-                continue
+                print("Не вдалося завантажити дані, перевірте з'єднання або параметри.")
+                return
 
             print(
                 f"Пошук пар FVG для IFVG з фільтром >{config['min_gap_percentage']}% для {base_symbol}..."
             )
-            fvg_pairs = find_all_fvg_pairs(df, symbol, timeframe)
+            fvg_pairs = find_all_fvg_pairs(df, full_symbol, timeframe)
 
             print_fvg_pairs(fvg_pairs)
             if plot_enabled:
-                plot_ifvg(
-                    base_symbol,
-                    timeframe,
-                    df,
-                    fvg_pairs,
-                    filename=f"ifvg_chart_{base_symbol}_{timeframe}.png",
-                )
-    else:
-        base_symbol = symbol
-        full_symbol = f"{base_symbol}/USDT"
-        print(f"Завантаження даних для {base_symbol} на {timeframe}...")
-        df = fetch_ohlcv(EXCHANGE, full_symbol, timeframe, config["limit"])
-        if df.empty:
-            print("Не вдалося завантажити дані, перевірте з'єднання або параметри.")
-            return
-
-        print(
-            f"Пошук пар FVG для IFVG з фільтром >{config['min_gap_percentage']}% для {base_symbol}..."
-        )
-        fvg_pairs = find_all_fvg_pairs(df, full_symbol, timeframe)
-
-        print_fvg_pairs(fvg_pairs)
-        if plot_enabled:
-            plot_ifvg(base_symbol, timeframe, df, fvg_pairs)
+                plot_ifvg(base_symbol, timeframe, df, fvg_pairs)
 
 
 if __name__ == "__main__":

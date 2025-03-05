@@ -7,5 +7,7 @@
     },
     "mongodb_uri": "mongodb://localhost:27017/",
     "database_name": "ifvg_database",
-    "collection_name": "ifvgs"
+    "collection_name": "ifvgs",
+    "telegram_bot_token": "",
+    "chat_id": ""
 }
