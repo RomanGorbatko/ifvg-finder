@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-from pprint import pprint
 from typing import Dict, List, Optional
 from telegram import Bot
 import ccxt
@@ -11,12 +10,15 @@ from plotly.subplots import make_subplots
 import hashlib
 from pymongo import MongoClient, ASCENDING
 import json
+import os
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-with open("config.json", "r") as f:
+dirname = os.path.dirname(__file__)
+filename = os.path.join(dirname, 'config.json')
+with open(filename, "r") as f:
     config = json.load(f)
 
 EXCHANGE = ccxt.binance({"enableRateLimit": True})
